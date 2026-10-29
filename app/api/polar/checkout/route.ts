@@ -16,9 +16,12 @@ export async function GET(req: NextRequest) {
     const session = await getServerSession(authOptions);
 
     if (!session?.user?.id) {
-      const callbackUrl = `${req.nextUrl.pathname}${req.nextUrl.search}`;
       const loginUrl = new URL("/login", req.url);
-      loginUrl.searchParams.set("callbackUrl", callbackUrl);
+
+      loginUrl.searchParams.set(
+        "callbackUrl",
+        `${req.nextUrl.pathname}${req.nextUrl.search}`
+      );
 
       return NextResponse.redirect(loginUrl);
     }
@@ -29,6 +32,8 @@ export async function GET(req: NextRequest) {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL;
 
     if (!token || !appUrl) {
+      console.error("Polar configuration is incomplete.");
+
       return NextResponse.json(
         { error: "Polar is not configured." },
         { status: 500 }
@@ -37,27 +42,37 @@ export async function GET(req: NextRequest) {
 
     if (!plan || !productId) {
       return NextResponse.json(
-        { error: "Invalid plan or missing Polar product ID." },
+        { error: "Invalid plan or missing product ID." },
         { status: 400 }
       );
     }
 
     const polar = createPolar({
-  accessToken: token,
-  environment:
-    process.env.POLAR_ENVIRONMENT === "sandbox"
-      ? "sandbox"
-      : "production",
-});
+      accessToken: token,
+      environment:
+        process.env.POLAR_ENVIRONMENT === "sandbox"
+          ? "sandbox"
+          : "production",
+    });
+
+    // The external customer ID must be the actual database User.id.
+    const userId = session.user.id;
+
+    console.log("Creating Polar checkout:", {
+      plan,
+      productId,
+      hasUserId: Boolean(userId),
+      hasEmail: Boolean(session.user.email),
+    });
 
     const checkout = await polar.checkouts.create({
       products: [productId],
       success_url: `${appUrl}/editor?checkout=success`,
       customer_email: session.user.email ?? undefined,
-      external_customer_id: session.user.id,
+      external_customer_id: userId,
       metadata: {
         plan,
-        userId: session.user.id,
+        userId,
         source: "reva-box",
       },
     });

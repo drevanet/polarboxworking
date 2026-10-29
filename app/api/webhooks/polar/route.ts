@@ -1,4 +1,3 @@
-
 import { NextRequest, NextResponse } from "next/server";
 import { webhooks } from "@polar-sh/sdk/2026-10";
 import { prisma } from "@/lib/prisma";
@@ -17,7 +16,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Verify the signature using the original request body.
+  // Verify the original request body and webhook signature.
   let event: any;
 
   try {
@@ -31,7 +30,11 @@ export async function POST(req: NextRequest) {
         req.headers.get("webhook-signature") ?? "",
     };
 
-    event = await webhooks.validateEvent(rawBody, headers, secret);
+    event = await webhooks.validateEvent(
+      rawBody,
+      headers,
+      secret
+    );
   } catch (error) {
     console.error(
       "Polar signature verification failed:",
@@ -63,26 +66,20 @@ export async function POST(req: NextRequest) {
 
     const d = event.data;
 
-    // Match the Polar subscription to your Reva Box account.
-    const userId =
-      d?.customer?.external_id ??
-      d?.external_customer_id ??
-      d?.metadata?.userId;
-
-    if (!userId || !d?.id || !d?.product_id) {
-      console.error("Missing subscription mapping:", {
+    if (!d?.id || !d?.product_id) {
+      console.error("Missing subscription details:", {
         eventType: event.type,
-        subscriptionId: d?.id,
-        productId: d?.product_id,
-        hasUserId: Boolean(userId),
+        hasSubscriptionId: Boolean(d?.id),
+        hasProductId: Boolean(d?.product_id),
       });
 
       return NextResponse.json(
-        { error: "Missing subscription mapping metadata." },
+        { error: "Missing subscription details." },
         { status: 400 }
       );
     }
 
+    // Resolve the plan from checkout metadata or configured products.
     const plan =
       d?.metadata?.plan ??
       (d.product_id === process.env.POLAR_PRODUCT_MONTHLY
@@ -93,8 +90,11 @@ export async function POST(req: NextRequest) {
             ? "yearly"
             : null);
 
-    if (!plan) {
-      console.error("Unknown Polar product:", d.product_id);
+    if (!["monthly", "biweekly", "yearly"].includes(plan)) {
+      console.error("Unknown Polar product or plan:", {
+        productId: d.product_id,
+        plan: plan ?? null,
+      });
 
       return NextResponse.json(
         { error: "Unknown subscription product." },
@@ -102,20 +102,55 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: String(userId) },
-      select: { id: true },
-    });
+    // Get the possible user identifiers from the event.
+    const externalId =
+      d?.customer?.external_id ??
+      d?.external_customer_id ??
+      d?.metadata?.userId ??
+      null;
+
+    const customerEmail =
+      d?.customer?.email ??
+      d?.customer_email ??
+      null;
+
+    let user = null;
+
+    // First attempt: match the database user ID.
+    if (externalId) {
+      user = await prisma.user.findUnique({
+        where: { id: String(externalId) },
+        select: { id: true, email: true },
+      });
+    }
+
+    // Second attempt: match the customer's email.
+    if (!user && customerEmail) {
+      user = await prisma.user.findUnique({
+        where: {
+          email: String(customerEmail).trim().toLowerCase(),
+        },
+        select: { id: true, email: true },
+      });
+    }
 
     if (!user) {
-      console.error("No Reva Box user found for Polar customer:", userId);
+      console.error("Polar user mapping failed:", {
+        eventType: event.type,
+        subscriptionId: d.id,
+        productId: d.product_id,
+        externalId: externalId ? String(externalId) : null,
+        hasCustomerEmail: Boolean(customerEmail),
+      });
 
+      // Do not acknowledge an event that has not been processed.
       return NextResponse.json(
-        { error: "User not found." },
+        { error: "User not found. Check Polar customer mapping." },
         { status: 404 }
       );
     }
 
+    // Map the Polar event to the application's subscription status.
     const statuses: Record<string, string> = {
       "subscription.created": d.status ?? "inactive",
       "subscription.updated": d.status ?? "inactive",
@@ -136,13 +171,18 @@ export async function POST(req: NextRequest) {
       ? new Date(d.current_period_end)
       : null;
 
+    const customerId =
+      d.customer_id ?? d.customer?.id ?? null;
+
+    // Create the subscription if necessary, or update the existing one.
     await prisma.subscription.upsert({
-      where: { userId: user.id },
+      where: {
+        userId: user.id,
+      },
 
       create: {
         userId: user.id,
-        polarCustomerId:
-          d.customer_id ?? d.customer?.id ?? null,
+        polarCustomerId: customerId,
         polarSubscriptionId: d.id,
         polarProductId: d.product_id,
         planKey: plan,
@@ -153,8 +193,7 @@ export async function POST(req: NextRequest) {
       },
 
       update: {
-        polarCustomerId:
-          d.customer_id ?? d.customer?.id ?? undefined,
+        polarCustomerId: customerId ?? undefined,
         polarSubscriptionId: d.id,
         polarProductId: d.product_id,
         planKey: plan,
@@ -164,10 +203,11 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    console.log("Reva Box subscription updated:", {
+    console.log("Reva Box subscription updated successfully:", {
       userId: user.id,
       plan,
       status,
+      subscriptionId: d.id,
     });
 
     return NextResponse.json({ received: true });
