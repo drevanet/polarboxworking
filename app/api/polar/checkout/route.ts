@@ -1,79 +1,140 @@
 
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { Polar } from "@polar-sh/sdk";
-import { authOptions } from "@/lib/auth";
+import { webhooks } from "@polar-sh/sdk/2026-10";
+import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
-const products: Record<string, string | undefined> = {
-  monthly: process.env.POLAR_PRODUCT_MONTHLY,
-  biweekly: process.env.POLAR_PRODUCT_BIWEEKLY,
-  yearly: process.env.POLAR_PRODUCT_YEARLY,
-};
+export async function POST(req: NextRequest) {
+  const secret = process.env.POLAR_WEBHOOK_SECRET;
 
-export async function GET(req: NextRequest) {
-  const plan = req.nextUrl.searchParams.get("plan");
-  const productId = plan ? products[plan] : undefined;
+  if (!secret) {
+    console.error("POLAR_WEBHOOK_SECRET is missing.");
 
-  // Validate the selected plan.
-  if (!plan || !productId) {
     return NextResponse.json(
-      { error: "Invalid plan or missing Polar product ID." },
-      { status: 400 }
-    );
-  }
-
-  // Check the user's authentication status.
-  const session = await getServerSession(authOptions);
-
-  if (!session?.user?.id) {
-    const callbackUrl = `/api/polar/checkout?plan=${encodeURIComponent(plan)}`;
-
-    const signupUrl = new URL("/signup", req.url);
-    signupUrl.searchParams.set("callbackUrl", callbackUrl);
-    signupUrl.searchParams.set("plan", plan);
-
-    return NextResponse.redirect(signupUrl);
-  }
-
-  const token = process.env.POLAR_ACCESS_TOKEN;
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL;
-
-  if (!token || !appUrl) {
-    return NextResponse.json(
-      { error: "Polar is not configured." },
+      { error: "Webhook is not configured." },
       { status: 500 }
     );
   }
 
+  let event;
+
   try {
-    const polar = new Polar({
-      accessToken: token,
-      server:
-        process.env.POLAR_ENVIRONMENT === "sandbox"
-          ? "sandbox"
-          : "production",
-    });
+    // Signature verification requires the original, unmodified body.
+    const rawBody = await req.text();
 
-    const checkout = await polar.checkouts.create({
-      products: [productId],
-      successUrl: `${appUrl}/editor?checkout=success`,
-      customerEmail: session.user.email ?? undefined,
-      externalCustomerId: session.user.id,
-      metadata: {
-        plan,
-        userId: session.user.id,
-        source: "reva-box",
+    event = await webhooks.validateEvent(
+      rawBody,
+      {
+        "webhook-id": req.headers.get("webhook-id") ?? "",
+        "webhook-timestamp":
+          req.headers.get("webhook-timestamp") ?? "",
+        "webhook-signature":
+          req.headers.get("webhook-signature") ?? "",
       },
-    });
-
-    return NextResponse.redirect(checkout.url);
+      secret
+    );
   } catch (error) {
-    console.error("Polar checkout error:", error);
+    console.error(
+      "Polar webhook signature verification failed:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
 
     return NextResponse.json(
-      { error: "Could not create checkout session." },
+      { error: "Invalid webhook signature." },
+      { status: 403 }
+    );
+  }
+
+  try {
+    console.log("Verified Polar webhook event:", event.type);
+
+    switch (event.type) {
+      case "subscription.created":
+      case "subscription.updated": {
+        const subscription = event.data;
+
+        const userId = subscription.customer.external_id;
+        const subscriptionId = subscription.id;
+        const productId = subscription.product_id;
+
+        if (!userId) {
+          console.error(
+            "Subscription event has no external customer ID.",
+            subscriptionId
+          );
+
+          return NextResponse.json(
+            { error: "Missing external customer ID." },
+            { status: 400 }
+          );
+        }
+
+        const status = subscription.status;
+        const isActive =
+          status === "active" || status === "trialing";
+
+        const planKey =
+          productId === process.env.POLAR_PRODUCT_MONTHLY
+            ? "monthly"
+            : productId === process.env.POLAR_PRODUCT_BIWEEKLY
+              ? "biweekly"
+              : productId === process.env.POLAR_PRODUCT_YEARLY
+                ? "yearly"
+                : null;
+
+        await prisma.subscription.upsert({
+          where: { userId },
+          create: {
+            userId,
+            polarSubscriptionId: subscriptionId,
+            polarCustomerId: subscription.customer_id,
+            polarProductId: productId,
+            planKey,
+            status: isActive ? status : status,
+          },
+          update: {
+            polarSubscriptionId: subscriptionId,
+            polarCustomerId: subscription.customer_id,
+            polarProductId: productId,
+            planKey,
+            status,
+          },
+        });
+
+        break;
+      }
+
+      case "subscription.canceled": {
+        const subscription = event.data;
+        const userId = subscription.customer.external_id;
+
+        if (userId) {
+          await prisma.subscription.updateMany({
+            where: {
+              userId,
+              polarSubscriptionId: subscription.id,
+            },
+            data: {
+              status: subscription.status,
+            },
+          });
+        }
+
+        break;
+      }
+
+      default:
+        // Other events can be acknowledged without changing subscription data.
+        console.log("No subscription update required for:", event.type);
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error("Polar webhook processing failed:", error);
+
+    return NextResponse.json(
+      { error: "Webhook processing failed." },
       { status: 500 }
     );
   }
